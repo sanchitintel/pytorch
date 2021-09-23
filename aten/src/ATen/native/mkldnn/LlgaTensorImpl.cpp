@@ -1,5 +1,6 @@
 #include <ATen/native/mkldnn/LlgaTensorImpl.h>
 #include <c10/core/CPUAllocator.h>
+#include <torch/csrc/jit/codegen/onednn/runtime.h>
 
 namespace at {
 
@@ -68,7 +69,9 @@ const LlgaTensorDesc& get_llga_desc(const Tensor& tensor) {
 }
 
 dnnl::graph::tensor llga_from_aten_tensor(const Tensor& tensor) {
-  return {get_llga_desc(tensor).logical_tensor(), tensor.data_ptr()};
+  return {get_llga_desc(tensor).logical_tensor(),
+          torch::jit::fuser::onednn::Engine::getEngine(),
+          tensor.data_ptr()};
 }
 
 using data_type = dnnl::graph::logical_tensor::data_type;

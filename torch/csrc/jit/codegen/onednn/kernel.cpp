@@ -64,17 +64,11 @@ ArgSpecs LlgaKernel::specializeInputSpecs(const TensorArgs& inputs) const {
   return inputSpecs;
 }
 
-ArgSpecs LlgaKernel::specializeOutputSpecs(
-    const partition& partition,
-    const ArgSpecs& inputSpecs) const {
-  auto inputs = fmap(inputSpecs, toLogicalTensor);
-  auto outputs = fmap(graph_->outputs(), toLogicalTensor);
-  partition.infer_shape(inputs, outputs);
-
+ArgSpecs LlgaKernel::specializeOutputSpecs() const {
   ArgSpecs outputSpecs;
   outputSpecs.reserve(nOutputs_);
   for (size_t i = 0; i < nOutputs_; i++) {
-    auto spec = ArgSpec(outputs[i]).dtype(inputSpecs[0].dtype());
+    auto spec = ArgSpec(graph_->outputs()[i]);
     if (useOpaqueLayout(i))
       spec = spec.any();
     outputSpecs.emplace_back(spec);
@@ -88,7 +82,7 @@ std::tuple<RunArgs, RunArgs> LlgaKernel::prepareRunArgs(
   RunArgs runInputs, runOutputs;
   for (size_t i = 0; i < nInputs_; i++) {
     auto spec = inputSpecs_[i];
-    runInputs.push_back({spec.logical_tensor(), inputs[i].data_ptr()});
+    runInputs.push_back({spec.logical_tensor(), Engine::getEngine(), inputs[i].data_ptr()});
   }
 
   for (size_t i = 0; i < nOutputs_; i++) {
@@ -102,7 +96,7 @@ std::tuple<RunArgs, RunArgs> LlgaKernel::prepareRunArgs(
       auto inputOffset = iter->second;
       auto inputTensor = inputs[inputOffset];
       outputs.push_back(inputTensor);
-      runOutputs.push_back({spec.logical_tensor(), inputTensor.data_ptr()});
+      runOutputs.push_back({spec.logical_tensor(), Engine::getEngine(), inputTensor.data_ptr()});
     } else if (spec.is_opaque()) {
       auto tensor = at::empty_llga(spec, opt);
       outputs.push_back(tensor);
@@ -110,7 +104,7 @@ std::tuple<RunArgs, RunArgs> LlgaKernel::prepareRunArgs(
     } else {
       auto tensor = at::empty(spec.sizes(), opt);
       outputs.push_back(tensor);
-      runOutputs.push_back({spec.logical_tensor(), tensor.data_ptr()});
+      runOutputs.push_back({spec.logical_tensor(), Engine::getEngine(), tensor.data_ptr()});
     }
   }
 
@@ -168,7 +162,7 @@ void LlgaKernel::run(Stack& stack) {
       GRAPH_DEBUG("Specializing input logical tensors");
       inputSpecs_ = specializeInputSpecs(inputs);
       GRAPH_DEBUG("Inferring output logical tensors");
-      outputSpecs_ = specializeOutputSpecs(partition_, inputSpecs_);
+      outputSpecs_ = specializeOutputSpecs();
       GRAPH_DEBUG("Compiling partition");
       compilation_ = compile(partition_);
       is_initialized_ = true;
