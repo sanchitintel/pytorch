@@ -27,6 +27,12 @@ def get_eltwise_fn(name):
     else:
         raise NameError('Eltwise function %s not found' % name)
 
+def bn_weight_init(m):
+    if isinstance(m, torch.nn.BatchNorm2d):
+        if m.weight is not None and m.bias is not None:
+            torch.nn.init.normal_(m.weight)
+            torch.nn.init.normal_(m.bias)
+
 
 class TestOp(JitLlgaTestCase):
     def test_conv2d(self):
@@ -66,6 +72,23 @@ class TestOp(JitLlgaTestCase):
 
     def test_bn2d(self):
         m = nn.BatchNorm2d(32).eval()
+        # single bn: 
+        # If use the default initialization:
+        # m.weight = 1, m.running_var = 1
+        # m.bias = 0, m.running_mean = 0
+        # After freezing, all these parameters become Constant and
+        # the EliminateCommonSubexpression pass will transform the graph
+        # from:
+        #   %10 : Tensor = aten::batch_norm(%input, %weight, %bias, %running_mean, %running_var, %5, %4, %3, %2)
+        # to:
+        #    %10 : Tensor = aten::batch_norm(%input, %self.running_var, %self.running_mean, %self.running_mean, %self.running_var, %6, %7, %8, %9)
+        # oneDNN graph does not support inputs to operator to be the same logical tensor
+        # thus single bn cannot hit the fusion pattern
+        # We init the BN parameters in the UTs using normal distribution to avoid this issue
+        # In real usage scenario, real weights data will be loaded into the model and
+        # we won't have this issue.
+        m.apply(bn_weight_init)
+        
         x = torch.rand(1, 32, 28, 28)
         _, graph = self.checkTrace(m, [x])
         self.assertGraphContainsExactly(graph, LLGA_FUSION_GROUP, 1)
@@ -438,6 +461,11 @@ class TestModel(JitLlgaTestCase):
     @skipIfNoTorchVision
     def _test_vision(self, model_name):
         m = getattr(torchvision.models, model_name)().eval()
+        
+        # single BN is present in densenet121, please refer to the comment in test_bn2d
+        if model_name == "densenet121":
+            m.apply(bn_weight_init)
+
         x = torch.rand(1, 3, 224, 224) / 10
         _, graph = self.checkTrace(m, [x])
         self.assertFused(graph, ['aten::_convolution', 'aten::batch_norm',
