@@ -187,4 +187,31 @@ class LeftRight final {
   std::mutex _writeMutex;
 };
 
+// LeftRightForMobile is a pass-through (just to maintain API
+// compatibility) with the non-mobile build.
+template <class T>
+class LeftRightForMobile final {
+ public:
+  template <class... Args>
+  explicit LeftRightForMobile(const Args&... args) : _data{args...} {}
+
+  // Copying and moving would not be threadsafe.
+  // Needs more thought and careful design to make that work.
+  LeftRightForMobile(const LeftRightForMobile&) = delete;
+  LeftRightForMobile(LeftRightForMobile&&) noexcept = delete;
+  LeftRightForMobile& operator=(const LeftRightForMobile&) = delete;
+  LeftRightForMobile& operator=(LeftRightForMobile&&) noexcept = delete;
+
+  template <typename F>
+  auto read(F&& readFunc) const -> typename std::result_of<F(const T&)>::type {
+    return readFunc(_data);
+  }
+
+  template <typename F>
+  auto write(F&& writeFunc) -> typename std::result_of<F(T&)>::type {
+    return writeFunc(_data);
+  }
+  T _data;
+};
+
 } // namespace c10
