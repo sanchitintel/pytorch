@@ -4,6 +4,7 @@
 #include <ATen/ExpandUtils.h>
 #include <ATen/Parallel.h>
 #include <ATen/TensorGeometry.h>
+#include <c10/core/ScalarTypeToTypeMeta.h>
 #include <c10/util/irange.h>
 #include <c10/util/string_utils.h>
 #include <torch/csrc/jit/jit_log.h>
@@ -642,6 +643,22 @@ ArgValue TensorExprKernel::toArg(const torch::jit::Value* v) const {
       return ArgNone();
     } else if (val.isIntList()) {
       return val.toIntVector();
+    } else if (val.isDoubleList()) {
+      return val.toDoubleVector();
+    } else if (val.isTensor()) {
+      const auto t = val.toTensor();
+      c10::ScalarType dtype = c10::typeMetaToScalarType(t.dtype());
+      switch (dtype) {
+        case ScalarType::Float:
+          return t.item().toFloat();
+        case ScalarType::Long:
+          return t.item().toLong();
+        default:
+          std::stringstream ss;
+          ss << "Unsupported tensor dtype:" << dtype
+             << " for conversion constant 0-dim Tensor to scalar" << std::endl;
+          throw unsupported_dtype(ss.str());
+      }
     } else {
       throw unsupported_dtype(val.type()->str());
     }
@@ -664,6 +681,7 @@ std::vector<ExprHandle> TensorExprKernel::sizesFromVaryingShape(
 
 std::vector<ExprHandle> TensorExprKernel::sizesForValue(
     const torch::jit::Value* v) {
+  auto kind = v->type()->kind();
   if (known_sizes_.count(v)) {
     return known_sizes_.at(v);
   }
@@ -683,6 +701,11 @@ std::vector<ExprHandle> TensorExprKernel::sizesForValue(
   }
   if (v->type()->isSubtypeOf(NoneType::get())) {
     return {};
+  }
+  if (v->type()->kind() == TypeKind::ClassType) {
+    // TODO: By prepack class name run corresponding op with random inputs with
+    // the same sizes and get the size of the result.
+    return {int64_t{1024}};
   }
 
   known_sizes_[v] = inferSizesForValue(v);
@@ -1386,6 +1409,56 @@ Tensor computePrepackedLinearClampRun(
   return Tensor(ResultBuf.node(), s);
 }
 
+Tensor computeUpsampleNearest2d(
+    const std::vector<ArgValue>& inputs,
+    const std::vector<ExprHandle>& outputShape,
+    const c10::optional<ScalarType>& outputType) {
+  Dtype dtype = kFloat;
+  if (outputType) {
+    dtype = Dtype(*outputType);
+  }
+  int64_t output_size_h = -1;
+  int64_t output_size_w = -1;
+  if (auto output_sizes = c10::get_if<IntList>(&inputs[1])) {
+    output_size_h = (*output_sizes)[0];
+    output_size_w = (*output_sizes)[1];
+  }
+
+  double scale_factor_h = -1.f;
+  double scale_factor_w = -1.f;
+  if (auto scale_factors = c10::get_if<DoubleList>(&inputs[2])) {
+    scale_factor_h = (*scale_factors)[0];
+    scale_factor_w = (*scale_factors)[1];
+  }
+  const BufHandle& x = c10::get<BufHandle>(inputs[0]);
+
+  BufHandle ResultBuf("upsample_nearest2d", outputShape, dtype);
+  double qx_qscale = -1.f;
+  int64_t qx_qzero = -1l;
+  int64_t qx_qdtype = -1l;
+  if (isQuantized(x)) {
+    qx_qscale = immQScale(x);
+    qx_qzero = immQZero(x);
+    qx_qdtype = immQDType(x);
+
+    ResultBuf.node()->set_qscale(DoubleImm::make(qx_qscale).node());
+    ResultBuf.node()->set_qzero(DoubleImm::make(qx_qzero).node());
+  }
+
+  StmtPtr s = ExternalCall::make(
+      ResultBuf,
+      "nnc_upsample_nearest2d",
+      {x},
+      {qx_qscale,
+       qx_qzero,
+       qx_qdtype,
+       output_size_h,
+       output_size_w,
+       scale_factor_h,
+       scale_factor_w});
+  return Tensor(ResultBuf.node(), s);
+}
+
 Tensor tensorexpr::computeOperandValue(
     c10::Symbol op,
     const std::vector<ArgValue>& inputs,
@@ -1393,10 +1466,18 @@ Tensor tensorexpr::computeOperandValue(
     const c10::optional<ScalarType>& outputType,
     at::Device device) {
   const std::string opStr = op.toQualString();
-  if (opStr == "prepacked::conv2d_clamp_run") {
+  if ("prepacked::conv2d_clamp_run" == opStr) {
     return computePrepackedConv2dClampRun(inputs, outputShape, outputType);
-  } else if (opStr == "prepacked::linear_clamp_run") {
+  } else if ("prepacked::linear_clamp_run" == opStr) {
     return computePrepackedLinearClampRun(inputs, outputShape, outputType);
+  } else if ("quantized::conv2d_prepack" == opStr) {
+    return computeQuantizedConv2dPrepack(inputs, outputShape, outputType);
+  } else if ("quantized::conv2d" == opStr) {
+    return computeQuantizedConv2d(inputs, outputShape, outputType);
+  } else if ("quantized::conv2d_relu" == opStr) {
+    return computeQuantizedConv2dRelu(inputs, outputShape, outputType);
+  } else if ("quantized::add" == opStr) {
+    return computeQuantizedAdd(inputs, outputShape, outputType);
   }
   switch (op) {
     case aten::add: {
@@ -1672,6 +1753,15 @@ Tensor tensorexpr::computeOperandValue(
           outputShape,
           outputType,
           [](const ExprHandle& a) { return ExprHandle(1.0f) / a; });
+    } break;
+
+    case aten::contiguous: {
+      return computeOneOperand(
+          "aten_contiguous",
+          inputs,
+          outputShape,
+          outputType,
+          [](const ExprHandle& a) { return a; });
     } break;
 
     case aten::neg: {
@@ -2480,6 +2570,22 @@ Tensor tensorexpr::computeOperandValue(
     case aten::conv2d: {
       return computeConv2d(inputs, outputShape, outputType);
     } break;
+    case aten::upsample_nearest2d: {
+      return computeUpsampleNearest2d(inputs, outputShape, outputType);
+    } break;
+    case aten::linear: {
+      // linear = inputs[0] @ inputs[1] + inputs[2]
+      // addmm = beta(inputs[3]) * inputs[0] + alpha(inputs[4]) * inputs[1] @
+      // inputs[2]
+      std::vector<ArgValue> addmmInputs;
+      addmmInputs.reserve(5);
+      addmmInputs.push_back(inputs[2]);
+      addmmInputs.push_back(inputs[0]);
+      addmmInputs.push_back(inputs[1]);
+      addmmInputs.push_back(1l); // beta
+      addmmInputs.push_back(1l); // alpha
+      return computeAddMM(addmmInputs, outputShape, outputType);
+    } break;
     case aten::addmm: {
       return computeAddMM(inputs, outputShape, outputType);
     } break;
@@ -2489,6 +2595,18 @@ Tensor tensorexpr::computeOperandValue(
     case aten::adaptive_avg_pool2d: {
       return computeAdaptiveAvgPool2d(inputs, outputShape, outputType);
     } break;
+    case aten::quantize_per_tensor: {
+      return computeQuantizePerTensor(inputs, outputShape, outputType);
+    } break;
+    case aten::dequantize: {
+      return computeDequantize(inputs, outputShape, outputType);
+    } break;
+    default: {
+      std::string msg =
+          std::string("Unhandled node kind (in computeOperandValue): ") +
+          op.toQualString();
+      throw malformed_input(msg);
+    }
   }
   std::string msg =
       std::string("Unhandled node kind (in computeOperandValue): ") +
@@ -3126,19 +3244,23 @@ void TensorExprKernel::bindConstant(const torch::jit::Value* v) {
     return;
   }
   auto const_tensor = toIValue(v)->toTensor();
-
+  auto scalar_type = c10::typeMetaToScalarType(const_tensor.options().dtype());
   const auto& tt = v->type()->expect<TensorType>();
-  auto sizes = *tt->sizes().concrete_sizes();
+  auto sizes = const_tensor.sizes();
+  if (sizes.size() == 0) {
+    // Skipping binding 0-dim tensor as a buffer to use it as a scalar
+    return;
+  }
+
   std::vector<ExprHandle> te_sizes;
   te_sizes.reserve(sizes.size());
   for (auto s : sizes) {
     te_sizes.push_back(s);
   }
-
   BufPtr buf = alloc<Buf>(
       "const_" + sanitizeName(v->debugName()),
       ExprHandleVectorToExprVector(te_sizes),
-      ToDtype(static_cast<ScalarType>(*tt->scalarType())));
+      ToDtype(scalar_type));
 
   if (!const_tensor.is_contiguous()) {
     const_tensor = const_tensor.clone().contiguous();
