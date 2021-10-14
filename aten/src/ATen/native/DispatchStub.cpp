@@ -15,10 +15,11 @@ static CPUCapability compute_cpu_capability() {
     if (strcmp(envar, "vsx") == 0) {
       return CPUCapability::VSX;
     }
-#else
+#elif defined(HAVE_AVX512_CPU_DEFINITION)
     if (strcmp(envar, "avx512") == 0) {
       return CPUCapability::AVX512;
     }
+#elif defined(HAVE_AVX2_CPU_DEFINITION)
     if (strcmp(envar, "avx2") == 0) {
       return CPUCapability::AVX2;
     }
@@ -30,15 +31,11 @@ static CPUCapability compute_cpu_capability() {
   }
 
 #if !defined(__powerpc__) && !defined(__s390x__)
-  if (cpuinfo_initialize()) {
-    if (cpuinfo_has_x86_avx512vl() && cpuinfo_has_x86_avx512bw() &&  \
-        cpuinfo_has_x86_avx512dq() && cpuinfo_has_x86_fma3()) {
-      return CPUCapability::AVX512;
-    }
-    if (cpuinfo_has_x86_avx2() && cpuinfo_has_x86_fma3()) {
+#ifdef HAVE_AVX512_CPU_DEFINITION
+  return CPUCapability::AVX512;
+#elif defined(HAVE_AVX2_CPU_DEFINITION)
       return CPUCapability::AVX2;
-    }
-  }
+#endif // CPU_DEFINITION
 #endif
 #ifdef HAVE_VSX_CPU_DEFINITION
   return CPUCapability::VSX;
