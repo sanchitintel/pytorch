@@ -19,7 +19,7 @@ TORCH_API void fuseGraph(std::shared_ptr<Graph>& g);
 } // namespace onednn
 } // namespace fuser
 
-struct TORCH_API RegisterLlgaFuseGraph
+struct C10_EXPORT RegisterLlgaFuseGraph
     : public PassManager<RegisterLlgaFuseGraph> {
   static bool setEnabled(bool enabled) {
     bool oldState = fuser::onednn::getLlgaEnabled();
