@@ -25,9 +25,9 @@ LlgaKernel::LlgaKernel(const Node* fusionNode)
   auto llgaGraphHelper = LlgaGraphHelper(graph_);
   auto partitions = llgaGraphHelper.getPartitions();
   tensorIdToValue_ = llgaGraphHelper.getTensorIdToValue();
-
-  TORCH_CHECK(partitions.size() == 1,
-              "LLGA subgraph should contain only one partition");
+  TORCH_CHECK(
+      partitions.size() == 1,
+      "LLGA subgraph should contain only one partition");
   partition_ = partitions[0];
   nPartitionInputs_ = partition_.get_in_ports().size();
   GRAPH_DEBUG("Initialized ", debugName(), "\n", graph_->toString());
@@ -117,6 +117,13 @@ LlgaKernel::prepareRunArgs(const TensorArgs &inputs,
                          Engine::getEngine(),
                          constantInputs_[i].data_ptr()});
   }
+  for (size_t i = 0; i < constantInputs_.size(); i++) {
+    // constantInputSpecs are placed after graphInputSpecs
+    auto constantInputSpecIdx = nGraphInputs_ + i;
+    auto constantInputSpec = inputSpecs_[constantInputSpecIdx];
+    runInputs.push_back(
+        {constantInputSpec.logical_tensor(), constantInputs_[i].data_ptr()});
+  }
 
   for (size_t i = 0; i < nOutputs_; i++) {
     auto spec = outputSpecs_[i];
@@ -180,9 +187,9 @@ void LlgaKernel::run(Stack& stack) {
 
   // Grab input values from stack
   auto stackInputs = last(stack, nGraphInputs_);
-  auto inputs = fmap(stackInputs, [&](const IValue &v) {
-    TORCH_CHECK(v.isTensor(),
-                "Stack values for LLGA partition must be Tensor type");
+  auto inputs = fmap(stackInputs, [&](const IValue& v) {
+    TORCH_CHECK(
+        v.isTensor(), "Stack values for LLGA partition must be Tensor type");
     return v.toTensor();
   });
 
@@ -216,7 +223,7 @@ void LlgaKernel::run(Stack& stack) {
 
   // Update the stack.
   drop(stack, nGraphInputs_);
-  for (auto &o : outputs)
+  for (auto& o : outputs)
     push_one(stack, std::move(o));
   GRAPH_DEBUG("Stack updated");
 }
