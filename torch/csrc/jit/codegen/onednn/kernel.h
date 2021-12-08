@@ -33,17 +33,9 @@ class LlgaKernel {
  private:
   bool useOpaqueLayout(size_t offset) const;
 
-  // PyTorch copy constants inside the subgraph instead of referencing them.
-  // Constants inputs to the partition are no longer in the graph->inputs().
-  // Need use the tid retrieved from the partition to find the missing
-  // constant inputs.
-  void initializeConstantInputs();
+  ArgSpecs specializeInputSpecs(const TensorArgs& inputs) const;
 
-  ArgSpecs initializeInputSpecs(const TensorArgs& inputs);
-
-  ArgSpecs initializeOutputSpecs(
-      const dnnl::graph::partition& partition,
-      const ArgSpecs& inputSpecs) const;
+  ArgSpecs specializeOutputSpecs() const;
 
   dnnl::graph::compiled_partition compile(
       const dnnl::graph::partition& partition);
@@ -80,39 +72,16 @@ class LlgaKernel {
   at::Device device_ = at::kCPU;
   const Node* fusionNode_;
   std::shared_ptr<Graph> graph_;
-  int64_t nGraphInputs_ = 0; // number of inputs to graph_ on the IR
+  int64_t nInputs_ = 0;
   int64_t nOutputs_ = 0;
-  std::map<size_t, Value*> tensorIdToValue_;
   dnnl::graph::partition partition_;
-  // nPartitionInputs_ is the actual number of inputs to partition_ of graph_
-  // needed by the backend.
-  // nPartitionInputs_ = nGraphInputs_ + constantInputs_.size() since Constant
-  // inputs are copied to the inside of the subgraph
-  int64_t nPartitionInputs_;
   dnnl::graph::compiled_partition compilation_;
-  std::set<size_t> initializedInputIds_;
-  std::vector<Value*> constantValues_;
-  TensorArgs constantInputs_;
   ArgSpecs inputSpecs_;
   ArgSpecs outputSpecs_;
   std::unordered_map<size_t, size_t> inplacePairs_; // output id -> input offset
   std::string debugName_;
   rw_mutex_t rw_mutex_;
   bool is_initialized_ = false;
-};
-
-struct Engine {
-  // CPU engine singleton
-  static dnnl::graph::engine& getEngine();
-  Engine(const Engine&) = delete;
-  void operator=(const Engine&) = delete;
-};
-
-struct Stream {
-  // CPU stream singleton
-  static dnnl::graph::stream& getStream();
-  Stream(const Stream&) = delete;
-  void operator=(const Stream&) = delete;
 };
 
 } // namespace onednn

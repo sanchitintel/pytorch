@@ -9,6 +9,16 @@ namespace jit {
 namespace fuser {
 namespace onednn {
 
+dnnl::graph::engine& Engine::getEngine() {
+  static dnnl::graph::engine cpu_engine(dnnl::graph::engine::kind::cpu, 0);
+  return cpu_engine;
+}
+
+dnnl::graph::stream& Stream::getStream() {
+  static dnnl::graph::stream cpu_stream{Engine::getEngine(), nullptr};
+  return cpu_stream;
+}
+
 LlgaTensorImpl::LlgaTensorImpl(
     at::Storage&& storage,
     const caffe2::TypeMeta& data_type,
@@ -74,7 +84,7 @@ const LlgaTensorDesc& get_llga_desc(const at::Tensor& tensor) {
 }
 
 
-dnnl::graph::tensor llga_from_aten_tensor(const Tensor& tensor) {
+dnnl::graph::tensor llga_from_aten_tensor(const at::Tensor& tensor) {
   return {get_llga_desc(tensor).logical_tensor(),
           torch::jit::fuser::onednn::Engine::getEngine(),
           tensor.data_ptr()};

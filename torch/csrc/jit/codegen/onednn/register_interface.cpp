@@ -41,7 +41,6 @@ class RegisterInterface {
  public:
   RegisterInterface() {
     RegisterProfilingNode(canFuseNode);
-    torch::jit::RegisterLlgaFuseGraph::setEnabled(getLlgaEnvEnabled());
   }
 };
 
