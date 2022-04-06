@@ -331,7 +331,8 @@ bool checkInputCompatibility(Node* node) {
         return false;
       }
       auto dtype = tensor.scalar_type();
-      if ((dtype != at::ScalarType::Float) && (dtype != at::ScalarType::Long)) {
+      if ((dtype != at::ScalarType::BFloat16) &&
+        (dtype != at::ScalarType::Float) && (dtype != at::ScalarType::Long)) {
         return false;
       }
     } else if (inputIValue.isScalar()) {

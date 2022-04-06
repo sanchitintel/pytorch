@@ -81,6 +81,9 @@ struct LlgaTensorDesc {
     if (v->type()->isSubtypeOf(TensorType::get())) {
       auto tt = v->type()->cast<TensorType>();
 
+      if (tt->scalarType())
+        dtype_ = getLlgaDataType(tt->scalarType().value());
+
       auto sizes = tt->sizes();
       if (sizes.sizes()) {
         for (auto d : *sizes.sizes()) {
@@ -98,6 +101,8 @@ struct LlgaTensorDesc {
   }
 
   LlgaTensorDesc supplementTensorInfo(const at::Tensor& t) const;
+
+  desc::data_type getLlgaDataType(at::ScalarType dt) const;
 
   at::ScalarType aten_scalar_type() const;
 
