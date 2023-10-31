@@ -574,9 +574,9 @@ class GraphLowering(torch.fx.Interpreter):
             return target(*args, **kwargs)
 
         if target not in lowerings:
-            assert isinstance(
+            '''assert isinstance(
                 target, torch._ops.OpOverload
-            ), f"{target} is not an OpOverload"
+            ) or isinstance(target, torch._inductor.fx_passes.onednn_graph_fusion.OnednnGraphPartitionModule), f"{target} is not an OpOverload"'''
             base_name = target.name().split(".")[0]
             if base_name in FALLBACK_ALLOW_LIST:
                 make_fallback(target)
@@ -946,6 +946,8 @@ class GraphLowering(torch.fx.Interpreter):
         # Logged twice as per https://github.com/pytorch/pytorch/pull/99038#discussion_r1167826029
         # TODO. Revisit this once the logging API is more mature
         assert mod.__file__ is not None
+        #for name, value in self.constants.items():
+        #    setattr(mod, name, value)
         for name, value in self.opaque_ops.items():
             setattr(mod, name, value)
         log.debug("Output code written to: %s", mod.__file__)

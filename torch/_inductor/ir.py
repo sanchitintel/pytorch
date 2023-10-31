@@ -3733,16 +3733,14 @@ class RandomSeeds(ExternKernelOut):
             cpp_kernel="at::randint_out",
         )
 
-
 class ExternKernelAlloc(ExternKernel):
     def codegen(self, wrapper):
         self.codegen_comment(wrapper)
         args = [*self.codegen_args(), *self.codegen_kwargs()]
         if getattr(self.kernel, "is_opaque", False):
-            kernel_name = self.kernel.name()
+            V.graph.wrapper_code.generate_opaque_kernel_alloc(self.get_name(), self.kernel.name(), args)
         else:
-            kernel_name = self.kernel
-        V.graph.wrapper_code.generate_extern_kernel_alloc(self, args)
+            V.graph.wrapper_code.generate_extern_kernel_alloc(self, args)        
         if isinstance(self.layout, Layout):
             self.codegen_size_asserts(wrapper)
 
@@ -4110,6 +4108,7 @@ class FallbackKernel(ExternKernelAlloc):
             (
                 torch._ops.OpOverload,
                 torch._ops.HigherOrderOperator,
+                torch._inductor.fx_passes.onednn_graph_fusion.OnednnGraphPartitionModule
             ),
         ), f"Fails to create FallbackKernel for {kernel}: {type(kernel)} not supported"
 

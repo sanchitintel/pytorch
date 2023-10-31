@@ -13,6 +13,7 @@ import shutil
 import subprocess
 from typing import Any, Dict, List, Optional
 from unittest.mock import patch
+from torch.fx.passes.graph_drawer import FxGraphDrawer
 
 from functorch.compile import draw_graph, get_aot_graph_name, get_graph_being_compiled
 
@@ -443,6 +444,8 @@ class DebugFormatter:
     def fx_graph_transformed(
         self, gm: torch.fx.GraphModule, inputs: List[torch.Tensor]
     ):
+        g = FxGraphDrawer(gm, "BERT during debug")
+        g.get_dot_graph().write_svg("bert_after_post_grad.svg")
         with self.fopen("fx_graph_transformed.py") as fd:
             fd.write(gm.print_readable(print_output=False))
 
