@@ -101,7 +101,7 @@ def fuse_fx(gm: torch.fx.GraphModule, example_inputs) -> torch.fx.GraphModule:
     # make sure the autograd is disabled.
     if torch.is_grad_enabled() or not is_cpu:
         return gm
-    if config.freezing:
+    if config.freezing or config.cpp.onednn_graph:
         gm = remove_identity(gm)
         gm = fuse_conv_bn(gm)
     return gm

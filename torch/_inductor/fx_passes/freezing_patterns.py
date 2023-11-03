@@ -62,8 +62,9 @@ def freezing_passes(gm: torch.fx.GraphModule, aot_example_inputs):
     constant_fold(gm)
     fake_tensor_prop(gm, aot_example_inputs, True)
 
-    for pattern in pass_patterns:
-        pattern.apply(gm.graph)
+    if not config.cpp.onednn_graph:
+        for pattern in pass_patterns:
+            pattern.apply(gm.graph)
 
     # The CPU weight packing always assume the conv's weight is channels last,
     # So make sure the layout_optimization is on when doing it.
@@ -71,6 +72,7 @@ def freezing_passes(gm: torch.fx.GraphModule, aot_example_inputs):
         torch._C._has_mkldnn
         and config.cpp.weight_prepack
         and config.layout_optimization
+        and not config.cpp.onednn_graph
     ):
         from .mkldnn_fusion import _eliminate_duplicate_packed_nodes
 

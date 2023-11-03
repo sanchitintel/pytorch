@@ -1,5 +1,6 @@
 import itertools
 import logging
+import copy
 import numbers
 import threading
 from functools import lru_cache
@@ -150,14 +151,13 @@ class OnednnGraph:
         else:
             id = self.generate_id()
         op = llga.op(id, op_kind, name)
-        if kwargs is None:
-            kwargs = {}
-        for attr_key in kwargs:
-            if isinstance(attr_key, str):
-                if hasattr(llga.op, attr_key):
-                    op.set_attributes(getattr(llga.op, attr_key), kwargs[attr_key])
-            else:
-                op.set_attributes(attr_key, kwargs[attr_key])
+        if kwargs is not None:
+            for attr_key in kwargs:
+                if isinstance(attr_key, str):
+                    if hasattr(llga.op, attr_key):
+                        op.set_attributes(getattr(llga.op, attr_key), kwargs[attr_key])
+                else:
+                    op.set_attributes(attr_key, kwargs[attr_key])
         op.add_inputs(inputs)
         if outputs:
             op.add_outputs(outputs)
@@ -342,7 +342,7 @@ def get_filtered_partitions(
     filtered_partitions = []
     filtered_node_lists = []
     for partition, nodes in zip(supported_partitions, node_lists):
-        if any(node.target in allowed_ops for node in nodes):
+        if len(nodes) >= 2 or any(node.target in allowed_ops for node in nodes):
             filtered_partitions.append(partition)
             filtered_node_lists.append(nodes)
     # Need to reset descs with any_layout since set of supported partitions is different
@@ -393,7 +393,8 @@ class OnednnGraphPartitionModule:
         ]
 
         # TODO: remove detect_fake_mode with an meta impl
-        fake_mode = detect_fake_mode(args)
+        #fake_mode = detect_fake_mode(args)
+        fake_mode = isinstance(args[0], torch._subclasses.fake_tensor.FakeTensor)
         if fake_mode:
             input_descs = self.onednn_graph.update_input_descs(
                 self.input_descs, input_tensors
@@ -408,20 +409,20 @@ class OnednnGraphPartitionModule:
                 torch.empty_strided(out_desc.get_dims(), out_desc.get_strides())
                 for out_desc in output_descs
             ]
+            with self.lock:
+                if not self.kernel:
+                    cache_parameter = self.onednn_graph.is_inference
+                    '''self.input_descs = self.onednn_graph.update_input_descs(
+                        self.input_descs, input_tensors, cache_parameter
+                    )'''
+                    self.kernel = self.onednn_graph.compile_partition(
+                        self.partition, self.input_descs
+                    )
+                    self.output_descs = self.onednn_graph.get_compiled_output_descs(
+                        self.kernel,
+                        self.partition.get_output_ports()
+                    )
             return output_tensors[0] if len(output_tensors) == 1 else output_tensors
-
-        with self.lock:
-            if not self.kernel:
-                cache_parameter = self.onednn_graph.is_inference
-                self.input_descs = self.onednn_graph.update_input_descs(
-                    self.input_descs, input_tensors, cache_parameter
-                )
-                self.kernel = self.onednn_graph.compile_partition(
-                    self.partition, self.input_descs
-                )
-                self.output_descs = self.onednn_graph.get_compiled_output_descs(
-                    self.kernel, self.partition.get_output_ports()
-                )
 
         if not self.input_onednn_tensors:
             self.input_onednn_tensors = [
@@ -434,10 +435,10 @@ class OnednnGraphPartitionModule:
             for onednn_t, aten_t in zip(self.input_onednn_tensors, input_tensors):
                 onednn_t.from_aten(aten_t.data_ptr())
 
+
         if not self.output_tensors:
             self.output_tensors = [
-                allocate_empty_aten_from_desc(out_desc)
-                for out_desc in self.output_descs
+                allocate_empty_aten_from_desc(out_desc) for out_desc in self.output_descs
             ]
 
         if not self.output_onednn_tensors:
@@ -484,7 +485,7 @@ def build_onednn_graph(gm: GraphModule) -> OnednnGraph:
 
         def call_function(self, target, args, kwargs):
             # With placeholder defined, args is always a tuple of logical tensors except for the case of scalars
-            if not isinstance(target, torch._ops.OpOverload):
+            if not isinstance(target, torch._ops.OpOverload) and "_mkl_" not in self.current_node.name:
                 res = target(*args)
                 if "getitem" in self.current_node.name and isinstance(
                     res, llga.logical_tensor
@@ -497,6 +498,47 @@ def build_onednn_graph(gm: GraphModule) -> OnednnGraph:
                     )
                     return out_descs[0]
                 return res
+
+            '''modified_args = list(copy.copy(args))
+
+            # Create & replace logical tensors for constant tensor inputs
+            if target.name() in ["aten::convolution", "aten::batch_norm", "aten::addmm", "aten::bmm", "aten::mm"]:
+                # index of weight as per op schema in native_functions.yaml
+                weight_index = 1
+                if target.name == "aten::addmm":
+                    weight_index = 2
+
+                weight_node = onednn_graph.get_node_from_desc(args[weight_index])
+
+                # we are in inference mode
+                args_to_replace = [weight_index]
+                # we might need to replace more logical tensors
+                args_to_check = []
+                if target.name() == "aten::convolution":
+                    args_to_check = [2]
+                elif target.name() == "aten::batch_norm":
+                    args_to_check = [2, 3]
+                elif target.name() == "aten::addmm":
+                    args_to_check.append(0)
+
+                if args_to_check is not None:
+                    for index in args_to_check:
+                            if not args[index] is None:
+                                args_to_replace.append(index)
+
+                    for index in args_to_replace:
+                        lt_to_replace = args[index]
+                        node = onednn_graph.get_node_from_desc(lt_to_replace)
+                        modified_args[index] = llga.logical_tensor(
+                            onednn_graph.generate_id(),
+                            lt_to_replace.get_data_type(),
+                            lt_to_replace.shape,
+                            lt_to_replace.get_strides(),
+                            llga.logical_tensor.property_type.constant
+                        )
+                        onednn_graph.register_node_by_desc(node, modified_args[index])
+
+            modified_args = tuple(modified_args)'''
 
             out_descs = onednn_graph.create_onednn_descs_from_node(self.current_node)
 
@@ -894,7 +936,7 @@ def reapply_decomps(gm: GraphModule):
     gm.recompile()
 
 
-# define lowerings for aten IR to oneDNN IR
+# define lowerings from aten to oneDNN
 lowerings = {}
 
 
@@ -1044,6 +1086,11 @@ _lowerings_map = {
         "first",
         attribute_inputs={llga.op.axis: lambda in_descs: in_descs[1]},
     ),
+    #aten.cat: LoweringConfig(
+    #    llga.op.Concat,
+    #    lambda x: x[0],
+    #    {llga.op.axis: lambda x: x[1] if len(x) == 2 else 0},
+    #),
 }
 
 lowering_functions = []
@@ -1127,4 +1174,21 @@ def _onednn_view(onednn_graph, node_name, in_descs, out_descs, kwargs):
         in_descs[:1],
         out_descs,
         {llga.op.shape: out_descs[0].shape, llga.op.special_zero: True},
+    )
+
+@register_lowering(aten.batch_norm)
+def _onednn_batch_norm(
+    onednn_graph,
+    node_name: str,
+    in_descs,
+    out_descs: List[llga.logical_tensor],
+    kwargs,
+):
+    return onednn_graph.add_op(
+        llga.op.BatchNormInference,
+        node_name,
+        in_descs[:5],
+        out_descs,
+        epsilon=in_descs[7],
+        data_format="NCX"
     )

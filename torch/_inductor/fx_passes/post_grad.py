@@ -64,8 +64,6 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
     if config.dce:
         # has some issues with mutation in inference mode
         gm.graph.eliminate_dead_code()
-    g = FxGraphDrawer(gm, "BERT at beginning of post-grad")
-    g.get_dot_graph().write_svg("bert_at_beginning_of_post_grad.svg")
     if is_inference and config.reorder_for_locality:
         reorder_for_locality(gm.graph)
 
@@ -80,8 +78,6 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
             onednn_graph_fuse_fx(gm, is_inference)
         lazy_init()
-        g = FxGraphDrawer(gm, "BERT after oneDNN again")
-        g.get_dot_graph().write_svg("bert_after_second_onednn.svg")
         group_batch_fusion_post_grad_passes(gm.graph)
         remove_noop_ops(gm.graph)
 
