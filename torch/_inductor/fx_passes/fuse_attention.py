@@ -568,7 +568,7 @@ def _get_sfdp_patterns():
     # attn_mask
     b_inp = functools.partial(torch.empty, (1, 1, 8, 8), device=device)
     m_inp = functools.partial(torch.empty, (2, 1, 1, 4), device=device)
-    m_bert = functools.partial(torch.empty, (2, 8, 4, 4), device=device)
+    m_bert = functools.partial(torch.empty, (2, 1, 4, 4), device=device)
     # inv_scale
     c_inp = functools.partial(torch.tensor, 2.0, device=device)
     # workaround https://github.com/pytorch/pytorch/issues/97894
