@@ -448,37 +448,33 @@ def _sfdp_replacement_17(query, key, value, attn_mask, inv_scale, dropout_p):
         scale=1.0 / inv_scale,
     )
 
-def _sfdp_pattern_18(query, key, value, attn_mask, inv_scale, dropout_p):
+def _sfdp_pattern_18(query, key, value, attn_mask, dropout_p):
     # for Bert_pytorch with dropout
-    q = query.permute(0, 2, 1, 3)
-    k = key.permute(0, 2, 1, 3)
-    v = value.permute(0, 2, 1, 3)
-    scores = torch.matmul(q, k.transpose(-2, -1)).div(inv_scale)
+    q = query.permute([0, 2, 1, 3])
+    k = key.permute([0, 2, 1, 3])
+    v = value.permute([0, 2, 1, 3])
+    scores = torch.matmul(q, k.transpose(-2, -1)).div(math.sqrt(q.size(-1)))
     fill_value = torch.full((), -float(1000000000.0), dtype=query.dtype, device=query.device)
+    # attn_mask is already of the desired size in BERT_pytorch
+    # Source: https://github.com/codertimo/BERT-pytorch/blob/master/bert_pytorch/model/bert.py#L38
     scores = scores.masked_fill(attn_mask == 0, fill_value)   
     return torch.nn.functional.dropout(
         scores.softmax(dim=-1), dropout_p
     ).matmul(v)
 
 
-def _sfdp_replacement_18(query, key, value, attn_mask, inv_scale, dropout_p):
+def _sfdp_replacement_18(query, key, value, attn_mask, dropout_p):
     counters["inductor"]["fuse_attention"] += 1
-    bs = query.size(0)
-    n_head = query.size(2)
-    q_len = query.size(1)
-    k_len = key.size(1)
-    # do attn_mask->logical_not() in aten.scaled_dot_product_attention
-    attn_mask = (
-        (attn_mask == 1).view((bs, 1, 1, k_len)).expand((bs, n_head, q_len, k_len))
-    )
+    # attn_mask is already of the desired size in BERT_pytorch, and is already of bool dtype
+    # Source: https://github.com/codertimo/BERT-pytorch/blob/master/bert_pytorch/model/bert.py#L38
     return aten.scaled_dot_product_attention(
         query.transpose(1, 2),
         key.transpose(1, 2),
         value.transpose(1, 2),
-        attn_mask=attn_mask.to(dtype=torch.bool),
+        attn_mask=attn_mask,
         dropout_p=dropout_p,
         is_causal=False,
-        scale=1.0 / inv_scale,
+        scale=math.sqrt(query.size(-1)),
     )
 
 
@@ -586,7 +582,7 @@ def _get_sfdp_patterns():
         g = functools.partial(g_inp, dtype=dtype)
         b = functools.partial(b_inp, dtype=dtype)
         m = functools.partial(m_inp, dtype=dtype)
-        bert_m = functools.partial(m_bert, dtype=dtype)
+        bert_m = functools.partial(m_bert, dtype=torch.bool)
         c = functools.partial(c_inp, dtype=dtype)
         g_3d = functools.partial(g_3d_inp, dtype=dtype)
 
@@ -714,9 +710,9 @@ def _get_sfdp_patterns():
             (
                 _sfdp_pattern_18,
                 _sfdp_replacement_18,
-                [g(), g(), g(), bert_m(), c()],
+                [g(), g(), g(), bert_m()],
                 d,
-                _sfdp_extra_check(aten.div.Tensor),
+                _sfdp_params_check,
             ),
         ]:
             # XXX: when adding a new pattern, re-run `gen_attention_patterns` so the pattern
