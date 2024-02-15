@@ -448,6 +448,39 @@ def _sfdp_replacement_17(query, key, value, attn_mask, inv_scale, dropout_p):
         scale=1.0 / inv_scale,
     )
 
+def _sfdp_pattern_18(query, key, value, causal_mask, dropout_p):
+    # for hf_GPT2 with dropout
+    q = query.permute([0, 2, 1, 3])
+    k = key.permute([0, 2, 1, 3])
+    v = value.permute([0, 2, 1, 3])
+    attn_weights = torch.matmul(q, k.transpose(-1, -2))
+    attn_weights = attn_weights.div(
+        torch.full(
+            (), math.sqrt(v.size(-1)), dtype=attn_weights.dtype, device=attn_weights.device
+        )
+    )
+    causal_mask_value = torch.full((), -3.4028234663852886e+38, dtype=attn_weights.dtype, device=attn_weights.device)
+    return torch.nn.functional.dropout(
+        attn_weights.masked_fill(causal_mask, causal_mask_value).softmax(dim=-1), dropout_p
+    ).matmul(v)
+
+
+def _sfdp_replacement_18(query, key, value, causal_mask, dropout_p):
+    counters["inductor"]["fuse_attention"] += 1
+    # I'll add a custom fusion here, but am just trying to match
+    # the corresponding pattern for now
+    # While GPT2 codebase has a "causal mask", the computation
+    # in this pattern is similar to pattern 17
+    return aten.scaled_dot_product_attention(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        attn_mask = causal_mask,
+        dropout_p=dropout_p,
+        is_causal=False,
+        scale=math.sqrt(value.size(-1)),
+    )
+
 
 def _sfdp_params_check(match):
     assert all(k in match.kwargs for k in ("query", "key", "value"))
@@ -535,6 +568,8 @@ def _get_sfdp_patterns():
     # attn_mask
     b_inp = functools.partial(torch.empty, (1, 1, 8, 8), device=device)
     m_inp = functools.partial(torch.empty, (2, 1, 1, 4), device=device)
+    # causal_mask
+    gpt2_cmask = functools.partial(torch.empty, (1, 1, 4, 4), device=device)
     # inv_scale
     c_inp = functools.partial(torch.tensor, 2.0, device=device)
     # workaround https://github.com/pytorch/pytorch/issues/97894
@@ -552,6 +587,7 @@ def _get_sfdp_patterns():
         g = functools.partial(g_inp, dtype=dtype)
         b = functools.partial(b_inp, dtype=dtype)
         m = functools.partial(m_inp, dtype=dtype)
+        gpt2_c = functools.partial(gpt2_cmask, dtype=torch.bool)
         c = functools.partial(c_inp, dtype=dtype)
         g_3d = functools.partial(g_3d_inp, dtype=dtype)
 
@@ -675,6 +711,13 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), m(), c()],
                 d,
                 _sfdp_extra_check(aten.div.Tensor),
+            ),
+            (
+                _sfdp_pattern_18,
+                _sfdp_replacement_18,
+                [g(), g(), g(), gpt2_c()],
+                d,
+                _sfdp_params_check,
             ),
         ]:
             # XXX: when adding a new pattern, re-run `gen_attention_patterns` so the pattern
