@@ -102,13 +102,32 @@ def _sfdp_replacement_4(query, key, value, scale_factor, dropout_p):
     )
 
 
-def _sfdp_pattern_5(query, key, value, attn_mask):
+def _sfdp_pattern_5_cpu(query, key, value, attn_mask):
     attn_weight = torch.softmax(
         (query @ key.transpose(-2, -1) / math.sqrt(query.size(-1))) + attn_mask, dim=-1
     )
     # attn_weight = torch.dropout(attn_weight, dropout_p)
     return attn_weight @ value
 
+
+def _sfdp_replacement_5_cpu(query, key, value, attn_mask):
+    counters["inductor"]["fuse_attention"] += 1
+    scale_tensor = torch.full((), math.sqrt(query.size(-1)), dtype=query.dtype)
+    return torch.ops.mkldnn._graph_sdpa_pattern(
+        0 if query.dtype == torch.float else 1,
+        query,
+        key.transpose(2, -1),
+        value,
+        scale_tensor,
+        attn_mask.to(dtype=query.dtype),
+    )
+
+def _sfdp_pattern_5(query, key, value, attn_mask):
+    attn_weight = torch.softmax(
+        (query @ key.transpose(-2, -1) / math.sqrt(query.size(-1))) + attn_mask, dim=-1
+    )
+    # attn_weight = torch.dropout(attn_weight, dropout_p)
+    return attn_weight @ value
 
 def _sfdp_replacement_5(query, key, value, attn_mask):
     counters["inductor"]["fuse_attention"] += 1
@@ -478,17 +497,19 @@ def _sfdp_params_check(match):
 
 def _sfdp_extra_check(scale_factor_op, disable_cuda=False):
     def fn(match):
-        scale_factor_node = filter_nodes(match.nodes, scale_factor_op)[0]
-        # Note: args[1] of the scale_factor_node is always the scale_factor for the current patterns.
-        scale_factor = scale_factor_node.args[1]
-        # make sure the scale_factor a float/int. SymInt?
-        if not isinstance(scale_factor, (float, int)):
-            return False
+        # first check device
         if (
             disable_cuda
             and "query" in match.kwargs
             and "cuda" in str(match.kwargs["query"].meta["val"].device)
         ):
+            return False
+        # attempt scale_factor_op match
+        scale_factor_node = filter_nodes(match.nodes, scale_factor_op)[0]
+        # Note: args[1] of the scale_factor_node is always the scale_factor for the current patterns.
+        scale_factor = scale_factor_node.args[1]
+        # make sure the scale_factor a float/int. SymInt?
+        if not isinstance(scale_factor, (float, int)):
             return False
         return _sfdp_params_check(match)
 
@@ -555,13 +576,14 @@ def _get_sfdp_patterns():
         c = functools.partial(c_inp, dtype=dtype)
         g_3d = functools.partial(g_3d_inp, dtype=dtype)
 
-        for pattern, replacement, args, workaround, extra_check in [
+        for pattern, replacement, args, workaround, extra_check, enable_training in [
             (
                 _sfdp_pattern_1,
                 _sfdp_replacement_1,
                 [g(), g(), g(), c()],
                 {},
                 _sfdp_extra_check(aten.div.Tensor),
+                True,
             ),
             (
                 _sfdp_pattern_2,
@@ -569,6 +591,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), c()],
                 {},
                 _sfdp_extra_check(aten.mul.Tensor),
+                True,
             ),
             (
                 _sfdp_pattern_3,
@@ -576,6 +599,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), c()],
                 d,
                 _sfdp_extra_check(aten.div.Tensor),
+                True,
             ),
             (
                 _sfdp_pattern_4,
@@ -583,6 +607,15 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), c()],
                 d,
                 _sfdp_extra_check(aten.mul.Tensor),
+                True,
+            ),
+            (
+                _sfdp_pattern_5_cpu,
+                _sfdp_replacement_5_cpu,
+                [g(), g(), g(), b()],
+                {},
+                _sfdp_params_check,
+                False,
             ),
             (
                 _sfdp_pattern_5,
@@ -590,6 +623,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), b()],
                 {},
                 _sfdp_params_check,
+                True,
             ),
             (
                 _sfdp_pattern_6,
@@ -597,6 +631,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), b()],
                 d,
                 _sfdp_params_check,
+                True,
             ),
             (
                 _sfdp_pattern_7,
@@ -604,6 +639,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g()],
                 d,
                 _sfdp_params_check,
+                True,
             ),
             (
                 _sfdp_pattern_8,
@@ -611,6 +647,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g()],
                 {},
                 _sfdp_params_check,
+                True,
             ),
             (
                 _sfdp_pattern_9,
@@ -618,6 +655,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g()],
                 d,
                 _sfdp_params_check,
+                True,
             ),
             (
                 _sfdp_pattern_10,
@@ -625,6 +663,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g()],
                 {},
                 _sfdp_params_check,
+                True,
             ),
             (
                 _sfdp_pattern_11,
@@ -632,6 +671,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), c()],
                 {},
                 _sfdp_extra_check(aten.div.Tensor),
+                True,
             ),
             (
                 _sfdp_pattern_12,
@@ -639,6 +679,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), c()],
                 d,
                 _sfdp_extra_check(aten.div.Tensor),
+                True,
             ),
             (
                 _sfdp_pattern_13,
@@ -646,6 +687,7 @@ def _get_sfdp_patterns():
                 [g_3d(), g_3d(), g_3d()],
                 d,
                 _sfdp_params_check,
+                True,
             ),
             (
                 _sfdp_pattern_14,
@@ -653,6 +695,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), m(), c()],
                 {},
                 _sfdp_extra_check(aten.div.Tensor),
+                True,
             ),
             (
                 _sfdp_pattern_15,
@@ -660,6 +703,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), m(), c()],
                 {},
                 _sfdp_extra_check(aten.div.Tensor),
+                True,
             ),
             # TODO: Enable CUDA after solving Bert accuracy issue of calling efficient attention
             (
@@ -668,6 +712,7 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), m(), c()],
                 d,
                 _sfdp_extra_check(aten.div.Tensor, disable_cuda=True),
+                True,
             ),
             (
                 _sfdp_pattern_17,
@@ -675,25 +720,26 @@ def _get_sfdp_patterns():
                 [g(), g(), g(), m(), c()],
                 d,
                 _sfdp_extra_check(aten.div.Tensor),
+                True,
             ),
         ]:
             # XXX: when adding a new pattern, re-run `gen_attention_patterns` so the pattern
             # gets serialized to a python file and does not require tracing at runtime.
             assert isinstance(workaround, dict)
             name = pattern.__name__
-
-            training_name = (
-                f"{name}_training" if dtype == torch.float else f"{name}_training_half"
-            )
-            yield training_name, {
-                "search_fn": pattern,
-                "replace_fn": replacement,
-                "example_inputs": args,
-                "trace_fn": joint_fwd_bwd,
-                "pass_dicts": patterns,
-                "extra_check": extra_check,
-                "scalar_workaround": workaround,
-            }
+            if enable_training:
+                training_name = (
+                    f"{name}_training" if dtype == torch.float else f"{name}_training_half"
+                )
+                yield training_name, {
+                    "search_fn": pattern,
+                    "replace_fn": replacement,
+                    "example_inputs": args,
+                    "trace_fn": joint_fwd_bwd,
+                    "pass_dicts": patterns,
+                    "extra_check": extra_check,
+                    "scalar_workaround": workaround,
+                }
 
             if workaround:
                 assert len(workaround) == 1 and "dropout_p" in workaround
