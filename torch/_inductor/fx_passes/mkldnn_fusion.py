@@ -24,6 +24,7 @@ from .freezing_patterns import register_freezing_graph_pattern
 from .post_grad import register_lowering_pattern
 from .quantization import (
     _register_bert_large_mha_int8_pass,
+    _register_distilbert_large_mha_int8_pass,
     _register_quantization_lowerings,
     _register_quantization_weight_pack_pass,
     _register_woq_lowerings,
@@ -1229,6 +1230,7 @@ if torch._C._has_mkldnn:
     def _int8_mha_fusions_init():
         if config.onednn_graph and is_onednn_graph_supported():
             _register_bert_large_mha_int8_pass()
+            _register_distilbert_large_mha_int8_pass()
 
     @functools.lru_cache(None)
     def _mkldnn_weight_pack_init():
