@@ -979,7 +979,7 @@ _scaled_dot_product_flash_attention_cpu(
 
   bool has_attn_mask = attn_mask.has_value() && attn_mask.value().numel();
 
-  at::Tensor output;
+  at::Tensor output = at::empty({batchSize, qSize, num_head, headSize}, query.options());
   const auto accumulate_dtype = toOpMathType(dtype);
   at::Tensor logsumexp = at::empty(
       {batchSize, qSize, num_head}, query.options().dtype(accumulate_dtype));
@@ -995,13 +995,11 @@ _scaled_dot_product_flash_attention_cpu(
       (batchSize * num_head > 2 * at::get_num_threads()) &&
       ((has_attn_mask && (attn_mask.value().scalar_type() != at::ScalarType::Bool)) ||
       (!has_attn_mask))) {
-    output = at::empty({batchSize, num_head, qSize, headSize}, query.options());
 #if AT_ONEDNN_GRAPH_ENABLED()
     // The output is contiguous
     cpu_sdpa_inference_onednn_graph(output, query, key, value, attn_mask, scale);
 #endif // AT_ONEDNN_GRAPH_ENABLED()
   } else {
-    output = at::empty({batchSize, qSize, num_head, headSize}, query.options());
     flash_attention_kernel(
         kCPU,
         output,
@@ -1013,14 +1011,13 @@ _scaled_dot_product_flash_attention_cpu(
         is_causal,
         attn_mask,
         scale);
-    output = output.transpose(1, 2);
     // After the transpose above, the output would have discontiguous strides.
     // transpose is a view op, though, so only stride & size metadata gets updated.
     // Any trailing transpose(1, 2) & contiguous ops after the transpose above would not cause data movement.
     // That's because such a transpose would simply result in nullifying the effect of the transpose op
     // above by changing strides & sizes metadata. The contiguous following it would thus be a no-op.
   }
-
+  output = output.transpose(1, 2);
   logsumexp = logsumexp.transpose(1, 2);
 
   return std::make_tuple(std::move(output), std::move(logsumexp));

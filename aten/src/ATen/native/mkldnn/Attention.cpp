@@ -79,11 +79,31 @@ void create_partition(
   op matmul_v(
       op_idx++,
       op::kind::MatMul,
-      {softmax_out_dst_desc,
-       value_src_desc},
-      {output_dst_desc},
+      {softmax_out_dst_desc, value_src_desc},
+      {matmul_v_dst_desc},
       "matmul_value");
   g.add_op(matmul_v);
+
+  std::vector<int64_t> transpose_dims{0, 2, 1, 3};
+  logical_tensor transposed_post_sdpa(logical_tensor_id++, dtype);
+  op post_sdpa_transpose(
+      op_idx++,
+      op::kind::StaticTranspose,
+      {matmul_v_dst_desc},
+      {transposed_post_sdpa},
+      "transpose_post_sdpa");
+  post_sdpa_transpose.set_attr<dims>(
+      dnnl::graph::op::attr::order, transpose_dims);
+  g.add_op(post_sdpa_transpose);
+
+  logical_tensor reordered_output(logical_tensor_id++, dtype);
+  op reorder_output(
+      op_idx++,
+      op::kind::Reorder,
+      {transposed_post_sdpa},
+      {output_dst_desc},
+      "reorder_output");
+  g.add_op(reorder_output);
 
   g.finalize();
   auto partitions = g.get_partitions();
