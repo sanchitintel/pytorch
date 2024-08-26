@@ -475,6 +475,15 @@ def check_amx_extra(config, m, n, k, alpha, num_threads):
 @register_micro_gemm(
     *generate_gemm_config(
         VecAMX,
+        [(32, 32, 32)],
+        input_dtype=torch.bfloat16,
+        input2_dtype=torch.int32,
+        output_dtype=torch.float,
+        compute_dtype=torch.float,
+        extra_check=check_amx_extra,
+    ),
+    *generate_gemm_config(
+        VecAMX,
         [(32, 32, 32), (48, 16, 32), (16, 48, 32)],
         input_dtype=torch.bfloat16,
         input2_dtype=torch.int8,
@@ -507,6 +516,34 @@ class CppMicroGemmAMX(CppMicroGemm):
     TODO(jgong5): support int8 data type.
     """
 
+    DECLARE_KERNEL = r"""
+template <bool accum>
+inline void {{kernel_name}}(
+{%- if kernel_extra_args_declare %}
+    {{kernel_extra_args_declare}}
+{%- endif %}
+    const {{input_t}}* {{restrict_keyword}} A,
+    const {{input2_t}}* {{restrict_keyword}} B,
+    {%- if input_dtype == torch.bfloat16 and input2_dtype == torch.int32 %}
+    const {{input_t}}* {{restrict_keyword}} ScalesAndZeros,
+    {%- endif %}
+    {{output_t}}* {{restrict_keyword}} C,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    {%- if input_dtype == torch.bfloat16 and input2_dtype == torch.int32 %}
+    int64_t ldc,
+    int64_t q_group_size,
+    int64_t k_start,
+    int64_t actual_N
+    {%- else %}
+    int64_t ldc
+    {%- endif %}
+)
+"""
+
     TEMPLATE_ENTRY = r"""
 {{declare_kernel}} {
     TORCH_CHECK(N % {{block_n}} == 0, "N dimension must be multiple of {{block_n}}");
@@ -524,12 +561,22 @@ class CppMicroGemmAMX(CppMicroGemm):
                 {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}<accum>(
                     amx_state,
                     A + m * lda,
+                    {%- if input2_dtype == torch.int32 %}
+                    reinterpret_cast<const uint8_t*>(B) + n,
+                    ScalesAndZeros + n,
+                    {%- else %}
                     B + n,
+                    {%- endif %}
                     C + m * ldc + n,
                     K,
                     lda,
                     ldb,
                     ldc,
+                    {%- if input2_dtype == torch.int32 %}
+                    q_group_size,
+                    k_start,
+                    actual_N,
+                    {%- endif %}
                     16
                 );
                 block_m -= {{num_rows}};
@@ -540,12 +587,22 @@ class CppMicroGemmAMX(CppMicroGemm):
                 {{kernel_name}}_amx_kernel_16_{{num_columns}}<accum>(
                     amx_state,
                     A + m_tail * lda,
+                    {%- if input2_dtype == torch.int32 %}
+                    reinterpret_cast<const uint8_t*>(B) + n,
+                    ScalesAndZeros + n,
+                    {%- else %}
                     B + n,
+                    {%- endif %}
                     C + m_tail * ldc + n,
                     K,
                     lda,
                     ldb,
                     ldc,
+                    {%- if input2_dtype == torch.int32 %}
+                    q_group_size,
+                    k_start,
+                    actual_N,
+                    {%- endif %}
                     block_m
                 );
             }
@@ -554,17 +611,71 @@ class CppMicroGemmAMX(CppMicroGemm):
 }
 """
 
+    BOILERPLATE_CODE = r"""
+{%- if input_dtype == torch.bfloat16 and input2_dtype == torch.int32 %}
+  // Lookup table to de-quantize int4 values to bf16.
+  // Values are dequantized as truly int4 [-8, 7] range;
+  //
+  // dequant = (bf16(int4_value) * bf16_scale) + bf16_zero
+  //
+  static const __m512 lut = _mm512_set_ps(
+      7.0f, 6.0f, 5.0f, 4.0f,
+      3.0f, 2.0f, 1.0f, 0.0f,
+      -1.0f, -2.0f, -3.0f, -4.0f,
+      -5.0f, -6.0f, -7.0f, -8.0f);
+
+  // index for transpose
+  static const __m512i idx1 = _mm512_set_epi32(
+      30, 28, 26, 24, 22, 20, 18, 16,
+      14, 12, 10, 8, 6, 4, 2, 0);
+  static const __m512i idx2 = _mm512_set_epi32(
+      31, 29, 27, 25, 23, 21, 19, 17,
+      15, 13, 11, 9, 7, 5, 3, 1);
+
+inline __m128i convert_int4_to_int8(const uint8_t* data) {
+  __m128i tmp = _mm_loadu_si64((const __m128i*)data);
+  __m128i bytes = _mm_cvtepu8_epi16(tmp);
+  const __m128i lowMask = _mm_set1_epi8(0xF);
+  __m128i high = _mm_andnot_si128(lowMask, bytes);
+  __m128i low = _mm_and_si128(lowMask, bytes);
+  high = _mm_slli_epi16(high, 4);
+  bytes = _mm_or_si128(low, high);
+  return bytes;
+}
+
+inline bool is_group_start(int k_start, int index, int q_group_size) {
+    if C10_UNLIKELY((k_start == 0) && (index == 0)) {
+      return 1;
+    } else {
+        return ((k_start + index) % (q_group_size)) == 0;
+    }
+}
+
+{%- endif %}
+"""
+
     TEMPLATE_KERNEL = r"""
+
 template <bool accum>
 inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
     AMXState& amx_state,
     const {{input_t}}* {{restrict_keyword}} A,
+    {%- if input2_dtype == torch.int32 %}
+    const uint8_t* {{restrict_keyword}} B,
+    const {{input_t}}* {{restrict_keyword}} ScalesAndZeros,
+    {%- else %}
     const {{input2_t}}* {{restrict_keyword}} B,
+    {%- endif %}
     {{output_t}}* {{restrict_keyword}} C,
     int64_t K,
     int64_t lda,
     int64_t ldb,
     int64_t ldc,
+    {%- if input2_dtype == torch.int32 %}
+    int64_t q_group_size,
+    int64_t k_start,
+    int64_t actual_N,
+    {%- endif %}
     uint8_t tilecfg_rows
 ) {
     // TODO(jgong5): add prefetch hint for A, B, C
@@ -601,17 +712,13 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         zero_c();
     }
 
-{%- if input_dtype == torch.bfloat16 and input2_dtype == torch.int8 %}
+{%- if (input_dtype == torch.bfloat16) and input2_dtype in [torch.int32, torch.int8] %}
     // create a buffer for tiles of B.
-    // TODO: loop-unrolling of the "compute" lambda may result in incorrect output
-    // as this buffer would be used, so maybe 4 of these should be used?
-    // Since UT output is correct, looks like loop unrolling isn't actually happening.
     alignas(64) {{input_t}} bf16_weights_buf[512];
-
     int num_b_rows = (last_k_offset > 0) ? 16 : (tail_k_size * sizeof({{input_t}})) / 4;
+    {%- if input2_dtype == torch.int8 %}
     int b_tile_ptr_stride = ldb * {{vnni_size}};
 
-    // TODO: verify whether or not these lambdas inline
     auto load_B_row = [&]({{input2_t}}* src, {{input_t}}* dst) {
         {{kernel.unroll_pragma(2)}}
         for (int i = 0; i < 2; i++) {
@@ -631,6 +738,60 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
             );
         }
     };
+
+    {%- elif input2_dtype == torch.int32 %}
+    int b_tile_ptr_stride = 4 * ldb * {{vnni_size}};
+    // number of blocks on K
+    const int KB = K / {{block_k}};
+   __m512 scales[2];
+   __m512 zero_points[2];
+
+    // load scale and zero points
+    auto load_scale_and_zeros = [&](int i, int _kb) {
+        // load 2x bfloat16 vector
+        __m512i t = _mm512_loadu_si512((__m512i*)(ScalesAndZeros + _kb * actual_N * 2 + 32 * i));
+
+        // convert to 2x f32 vector
+        __m512 a, b;
+        at::vec::cvtbf16_fp32(t, a, b);
+
+        // transpose scale_and_zero from {16, 2} to {2, 16}
+        // inputs:
+        //   a: {s0, z0, s1, z1, ..., s7, z7}
+        //   b: {s8, z8, s9, z9, ..., s15, z15}
+        // output:
+        //   scale: {s0, s1, s2, ..., s15}
+        //   zero:  {z0, z1, z2, ..., z15}
+        scales[i] = _mm512_mask_permutex2var_ps(a, 0xffff, idx1, b);
+        zero_points[i] = _mm512_mask_permutex2var_ps(a, 0xffff, idx2, b);
+    };
+
+
+
+    auto load_B_row = [&](uint8_t* src, {{input_t}}* dst) {
+        {{kernel.unroll_pragma(2)}}
+        for (int i = 0; i < 2; i++) {
+            // int4 -> int8 -> int32 -> fp32 -> bf16
+            __m128i b8 = convert_int4_to_int8(src + i * 8);
+            __m512i b32 = _mm512_cvtepu8_epi32(b8);
+            auto pre_zps = _mm512_permutexvar_ps(b32, lut);
+            auto post_zps = _mm512_fmadd_ps(pre_zps, scales[i], zero_points[i]);
+            auto dequantized_bf16 = at::vec::cvtfp32_bf16(post_zps);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i * 16), dequantized_bf16);
+         }
+    };
+
+    auto load_B_in_buf = [&](uint8_t* B_ptr) {
+        {{kernel.unroll_pragma(8)}}
+        for (int i = 0; i < num_b_rows; i++) {
+            load_B_row(
+                B_ptr + i * b_tile_ptr_stride,
+                bf16_weights_buf + i * 32
+            );
+        }
+    };
+
+    {%- endif %}
 {%- endif %}
 
     auto compute = [&](int k) {
@@ -645,8 +806,12 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         _tile_stream_loadd({{tile_idx_a}}, A + {{tile_row * 16}} * lda + k, lda * sizeof({{input_t}}));
         {%- endif %}
         {%- if tile_row == 0 %}
-            {%- if input_dtype == torch.bfloat16 and input2_dtype == torch.int8 %}
+            {%- if input_dtype == torch.bfloat16 and input2_dtype in [torch.int8, torch.int32] %}
+                {%- if input2_dtype == torch.int8 %}
         load_B_in_buf(const_cast<{{input2_t}}*>(B) + k * ldb + {{tile_col * 16 * vnni_size}});
+                {%- elif input2_dtype == torch.int32 %}
+        load_B_in_buf(const_cast<uint8_t*>(B) + k * 4 * ldb + {{tile_col * 8 * vnni_size}});
+                {%- endif %}
         _tile_loadd({{tile_idx_b}}, bf16_weights_buf, 64);
             {%- else %}
         _tile_loadd({{tile_idx_b}}, B + k * ldb + {{tile_col * 16 * vnni_size}}, ldb * {{vnni_size}} * sizeof({{input_t}}));
@@ -662,7 +827,14 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
     };
 
     {{kernel.unroll_pragma(4)}}
+    {%- if input_dtype == torch.bfloat16 and input2_dtype == torch.int32 %}
+    for (int k = 0, kb = 0; k < last_k_offset; k += {{block_k}}) {
+        if (is_group_start(k_start, k, q_group_size)) {
+            c10::ForcedUnroll<2>{}(load_scale_and_zeros, kb++);
+        }
+    {%- else %}
     for (int k = 0; k < last_k_offset; k += {{block_k}}) {
+    {%- endif %}
         compute(k);
     }
 
@@ -690,6 +862,61 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
 }
 """
 
+    def codegen_call(
+        self,
+        kernel: CppTemplateKernel,
+        A: ir.Buffer,
+        B: ir.Buffer,
+        C: ir.Buffer,
+        accum: bool,
+        ZPS: ir.Buffer = None,
+        q_group_size: int = 0,
+        k_start: int = 0,
+        actual_N: int = 0,
+    ) -> str:
+        """
+        Generate the code for calling the templated kernel that computes
+        `C += alpha * A @ B` if `accum` is True, or `C = alpha * A @ B` otherwise.
+        """
+        A_ptr = f"&({kernel.index(A, [0, 0])})"
+        B_ptr = f"&({kernel.index(B, [0, 0])})"
+        if ZPS is not None:
+            assert q_group_size in [32, 64, 128, 256]
+            ZPS_ptr = f"&({kernel.index(ZPS, [0, 0])})"
+        C_ptr = f"&({kernel.index(C, [0, 0])})"
+        M = kernel.size(C, 0)
+        N = kernel.size(C, 1)
+        K = kernel.size(A, 1)
+        lda = kernel.stride(A, 0)
+        ldb = kernel.stride(B, 0)
+        ldc = kernel.stride(C, 0)
+        res = IndentedBuffer()
+        res.writeline(f"{self.name}<{value_to_cpp(accum, 'bool')}>(")
+        with res.indent():
+            extra_args = self.get_kernel_extra_args()
+            if extra_args:
+                res.writeline(extra_args)
+            res.writeline(f"{A_ptr},")
+            res.writeline(f"{B_ptr},")
+            if ZPS is not None:
+                res.writeline(f"{ZPS_ptr},")
+            res.writeline(f"{C_ptr},")
+            res.writeline(f"{M},")
+            res.writeline(f"{N},")
+            res.writeline(f"{K},")
+            res.writeline(f"{lda},")
+            res.writeline(f"{ldb},")
+            if ZPS is not None:
+                res.writeline(f"{ldc},")
+                res.writeline(f"{q_group_size},")
+                res.writeline(f"{k_start},")
+                res.writeline(f"{actual_N}")
+            else:
+                res.writeline(f"{ldc}")
+
+        res.writeline(");")
+        return res.getvalue()
+
     def codegen_define(self, kernel: CppTemplateKernel) -> str:
         block_m, block_n, block_k = self.register_blocking
         assert block_m % 16 == 0, "Only support block_m % 16 == 0 for AMX"
@@ -710,8 +937,12 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
             **self.get_common_options(),
         }
         result = ""
+        result += KernelTemplate._template_from_string(self.BOILERPLATE_CODE).render(
+            options
+        )
         for num_rows in range(block_m, 0, -16):
             amx_kernel_options = {**options, "num_rows": num_rows}
+
             result += KernelTemplate._template_from_string(self.TEMPLATE_KERNEL).render(
                 amx_kernel_options
             )
@@ -757,6 +988,7 @@ def create_micro_gemm(
     alpha=1,
     num_threads=-1,
     use_ref=True,
+    q_group_size=None,
 ) -> Optional[CppMicroGemm]:
     def create_from_config(cls, config: CppMicroGemmConfig):
         return cls(
@@ -769,6 +1001,9 @@ def create_micro_gemm(
             alpha,
         )
 
+    is_int4_woq_gemm = q_group_size is not None
+    if is_int4_woq_gemm:
+        assert input_dtype is torch.bfloat16 and input2_dtype is torch.int32
     assert isinstance(n, int) or n.is_number, n
     assert isinstance(k, int) or k.is_number, k
     m = V.graph.sizevars.size_hint(m, fallback=1) if isinstance(m, sympy.Expr) else m
@@ -789,7 +1024,6 @@ def create_micro_gemm(
                 config.input_dtype == input_dtype
                 and config.compute_dtype == compute_dtype
                 and config.input2_dtype == input2_dtype
-                and config.output_dtype == output_dtype
                 # The output_dtype here is the output dtype of the micro-kernel.
                 # In some cases, the actual output dtype of the op for which the micro-kernel
                 # is being created would be same as that of the activation, but the micro-kernels
@@ -801,6 +1035,9 @@ def create_micro_gemm(
                 ):
                     continue
                 block_m, block_n, block_k = config.register_blocking
+                if is_int4_woq_gemm and block_k != q_group_size:
+                    # block_k must be equal to q_group_size which can be either 32/64/128/256
+                    continue
                 # Criteria on the ranking of configurations
                 # 1. ISA: AMX > VEC
                 # 2. Dividable by block sizes (block_m, block_n, block_k)
