@@ -335,14 +335,14 @@ class CppMicroGemmRef(CppMicroGemm):
         input_dtype=torch.half,
         output_dtype=torch.float,
     ),
-    *generate_gemm_config(
-        VecAVX512,
-        [(8, 48, 1), (8, 32, 1), (16, 16, 1)],
-        input_dtype=torch.bfloat16,
-        input2_dtype=torch.int8,
-        output_dtype=torch.float,
-        compute_dtype=torch.float,
-    ),
+    #    *generate_gemm_config(
+    #        VecAVX512,
+    #        [(8, 48, 1), (8, 32, 1), (16, 16, 1)],
+    #        input_dtype=torch.bfloat16,
+    #        input2_dtype=torch.int8,
+    #        output_dtype=torch.float,
+    #        compute_dtype=torch.float,
+    #    ),
     *generate_gemm_config(
         VecAVX2,
         [(4, 24, 1), (4, 16, 1), (8, 8, 1)],
@@ -360,14 +360,14 @@ class CppMicroGemmRef(CppMicroGemm):
         input_dtype=torch.half,
         output_dtype=torch.float,
     ),
-    *generate_gemm_config(
-        VecAVX2,
-        [(4, 24, 1), (4, 16, 1), (8, 8, 1)],
-        input_dtype=torch.bfloat16,
-        input2_dtype=torch.int8,
-        output_dtype=torch.float,
-        compute_dtype=torch.float,
-    ),
+    #    *generate_gemm_config(
+    #        VecAVX2,
+    #        [(4, 24, 1), (4, 16, 1), (8, 8, 1)],
+    #        input_dtype=torch.bfloat16,
+    #        input2_dtype=torch.int8,
+    #        output_dtype=torch.float,
+    #        compute_dtype=torch.float,
+    #    ),
     *generate_gemm_config(
         VecNEON,
         [(4, 24, 1), (4, 16, 1), (8, 8, 1)],
@@ -900,6 +900,160 @@ inline void {{kernel_name}}_transpose_b_kernel(
             result += KernelTemplate._template_from_string(self.TEMPLATE_KERNEL).render(
                 options
             )
+        result += KernelTemplate._template_from_string(self.TEMPLATE_ENTRY).render(
+            options
+        )
+        return result
+
+
+@register_micro_gemm(
+    *generate_gemm_config(
+        VecAVX512,
+        [
+            (4, 32, 64),
+        ],
+        input_dtype=torch.bfloat16,
+        input2_dtype=torch.int8,
+        output_dtype=torch.float,
+        compute_dtype=torch.float,
+    ),
+)
+class CppMicroGemmWoQSmallMDim(CppMicroGemm):
+    """
+    This class generates the code for micro gemm using fp32 vec instructions for compute.
+    It supports input types of torch.float, torch.bfloat16, and torch.half with fp32 output.
+    The output of the microkernel is in FP32, but it would be converted to BF16/FP16 in the template,
+    if the desired output is BF16/FP16.
+    """
+
+    TEMPLATE_ENTRY = r"""
+{{declare_kernel}} {
+    {{kernel.assert_function}}(N % {{block_n}} == 0, "N dimension must be multiple of {{block_n}}");
+    {{kernel.assert_function}}(K % {{block_k}} == 0, "K dimension must be multiple of {{block_k}}");
+    int64_t block_m = std::min<int64_t>(M, {{block_m}});
+    for (int64_t m = 0; m < M; m += {{block_m}}) {
+        int64_t block_m = std::min<int64_t>(M - m, {{block_m}});
+        if (block_m == {{block_m}}) {
+            {{kernel_name}}_kernel<{{block_m}}, {{block_n}}, accum>(
+                A + m * lda,
+                B,
+                C + m * ldc,
+                K,
+                lda,
+                ldb,
+                ldc
+            );
+        } else {
+            switch (block_m) {
+    {%- for b in range(block_m - 1, 0, -1) %}
+            case {{b}}:
+                {{kernel_name}}_kernel<{{b}}, {{block_n}}, accum>(
+                    A + m * lda,
+                    B,
+                    C + m * ldc,
+                    K,
+                    lda,
+                    ldb,
+                    ldc
+                );
+                break;
+    {%- endfor %}
+            default:
+                {{kernel.assert_function}}(false, "Unsupported block_m: {{block_m}}");
+            }
+        }
+    }
+}
+"""
+
+    TEMPLATE_KERNEL = r"""
+template <int64_t BLOCK_M, int64_t BLOCK_N, bool accum>
+inline void {{kernel_name}}_kernel(
+    const {{input_t}}* {{restrict_keyword}} A,
+    const {{input2_t}}* {{restrict_keyword}} B,
+    {{output_t}}* {{restrict_keyword}} C,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc
+) {
+    using Vectorized = at::vec::Vectorized<{{compute_t}}>;
+    using VectorizedIn = at::vec::Vectorized<{{input_t}}>;
+    constexpr auto VLEN = Vectorized::size();
+    constexpr auto ROWS = BLOCK_M;
+    constexpr auto COLS = BLOCK_N / VLEN;
+
+    Vectorized va;
+    at::vec::VectorizedN<{{compute_t}}, COLS> vb;
+    at::vec::VectorizedN<{{compute_t}}, ROWS*COLS> vc;
+
+    auto loadc = [&](auto i) {
+        if constexpr (accum) {
+            constexpr int row = i / COLS;
+            constexpr int col = i % COLS;
+            vc[i] = Vectorized::loadu(C + row * ldc + col * VLEN);
+        } else {
+            vc[i] = Vectorized(0.0f);
+        }
+    };
+    c10::ForcedUnroll<ROWS * COLS>{}(loadc);
+
+    auto compute = [&, COLS](auto i, int k) {
+        constexpr int row = i / COLS;
+        constexpr int col = i % COLS;
+
+        if constexpr (col == 0) {
+{%- if alpha != 1 %}
+            va = Vectorized(static_cast<{{compute_t}}>(A[row * lda + k]) * {{alpha}});
+{%- else %}
+            va = Vectorized(static_cast<{{compute_t}}>(A[row * lda + k]));
+{%- endif %}
+        }
+
+        if constexpr (row == 0) {
+{%- if input2_dtype in [torch.bfloat16, torch.float16] %}
+            auto b = VectorizedIn::loadu(B + k * ldb + col * VLEN, VLEN);
+            vb[col] = at::vec::convert<{{compute_t}}>(b);
+{%- elif input2_dtype == torch.int8 %}
+            // Convert VLEN int8 elements to int32, and then fp32
+            auto b32 = at::vec::convert_to_int32<int8_t>(B + k * ldb + col * VLEN);
+            vb[col] = at::vec::convert<float>(b32);
+{%- else %}
+            vb[col] = Vectorized::loadu(B + k * ldb + col * VLEN);
+{%- endif %}
+        }
+
+        constexpr int idx = row * COLS + col;
+        vc[idx] = at::vec::fmadd(va, vb[col], vc[idx]);
+    };
+
+    for (int k = 0; k < K; ++k) {
+        c10::ForcedUnroll<ROWS * COLS>{}(compute, k);
+    }
+
+    // store to C
+    auto storec = [&](auto i) {
+        constexpr int row = i / COLS;
+        constexpr int col = i % COLS;
+        vc[i].store(C + row * ldc + col * VLEN);
+    };
+    c10::ForcedUnroll<ROWS * COLS>{}(storec);
+}
+"""
+
+    def codegen_define(self, kernel: CppTemplateKernel) -> str:
+        options = {
+            "declare_kernel": self.get_kernel_declaration(),
+            "kernel": kernel,
+            "block_m": self.register_blocking.block_m,
+            "block_n": self.register_blocking.block_n,
+            "block_k": self.register_blocking.block_k,
+            "restrict_keyword": get_restrict_keyword(),
+            **self.get_common_options(),
+        }
+        result = KernelTemplate._template_from_string(self.TEMPLATE_KERNEL).render(
+            options
+        )
         result += KernelTemplate._template_from_string(self.TEMPLATE_ENTRY).render(
             options
         )

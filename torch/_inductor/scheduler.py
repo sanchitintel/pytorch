@@ -3585,11 +3585,16 @@ class Scheduler:
 
             if not self.check_prologue_fusion_heuristics_fusable(node1, node2, why):
                 return False
-
+        do_not_fuse_epilogue = False
+        if node1.is_template() and getattr(node1, "node", None) is not None:
+            node1_name = getattr(node1.node.template, "name", "")
+            if "packed_gemm" in node1_name or "CppMicro" in node1_name:
+                do_not_fuse_epilogue = True
         if node1.is_template() and (
             node2.has_aliasing_or_mutation()
             or node2.is_reduction()
             or not config.epilogue_fusion
+            or do_not_fuse_epilogue
         ):
             why("template epilogue not satisfied")
             return False
