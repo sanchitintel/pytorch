@@ -920,26 +920,31 @@ inline void {{kernel_name}}_transpose_b_kernel(
 )
 class CppMicroGemmWoQSmallMDim(CppMicroGemm):
     """
-    This class generates the code for micro gemm using fp32 vec instructions for compute.
-    It supports input types of torch.float, torch.bfloat16, and torch.half with fp32 output.
-    The output of the microkernel is in FP32, but it would be converted to BF16/FP16 in the template,
-    if the desired output is BF16/FP16.
+    This class generates a macro-kernel & micro-kernel (in BLIS lexicon) for small M dimension for
+    input_dtype bfloat16 and input2_dtype int8.
     """
 
     TEMPLATE_ENTRY = r"""
 {{declare_kernel}} {
     {{kernel.assert_function}}(N % {{block_n}} == 0, "N dimension must be multiple of {{block_n}}");
     {{kernel.assert_function}}(K % {{block_k}} == 0, "K dimension must be multiple of {{block_k}}");
-    int64_t block_m = std::min<int64_t>(M, {{block_m}});
     for (int64_t m = 0; m < M; m += {{block_m}}) {
         int64_t block_m = std::min<int64_t>(M - m, {{block_m}});
         if (block_m == {{block_m}}) {
+            const int A_block_{{block_m}}_size = {{block_m}} * {{block_k}};
+            float A_block_{{block_m}}[A_block_{{block_m}}_size];
+            for (int A_row = 0; A_row < {{block_m}}; A_row++) {
+                for (int vec_num = 0; vec_num < 4; vec_num++) {
+                    __m512* tmp = reinterpret_cast<__m512*>(A_block_{{block_m}} + 16 * vec_num + 64 * A_row);
+                    *tmp = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(*reinterpret_cast<const __m256i*>(A + 16 * vec_num + (m + A_row) * lda)), 16));
+                }
+            }
             {{kernel_name}}_kernel<{{block_m}}, {{block_n}}, accum>(
-                A + m * lda,
+                A_block_{{block_m}},
                 B,
                 C + m * ldc,
                 K,
-                lda,
+                K,
                 ldb,
                 ldc
             );
@@ -947,16 +952,26 @@ class CppMicroGemmWoQSmallMDim(CppMicroGemm):
             switch (block_m) {
     {%- for b in range(block_m - 1, 0, -1) %}
             case {{b}}:
+                {
+                const int A_block_{{b}}_size = {{b}} * {{block_k}};
+                float A_block_{{b}}[A_block_{{b}}_size];
+                for (int A_row = 0; A_row < {{b}}; A_row++) {
+                    for (int vec_num = 0; vec_num < 4; vec_num++) {
+                        __m512* tmp = reinterpret_cast<__m512*>(A_block_{{b}} + 16 * vec_num + 64 * A_row);
+                        *tmp = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(*reinterpret_cast<const __m256i*>(A + 16 * vec_num + (m + A_row) * lda)), 16));
+                    }
+                }
                 {{kernel_name}}_kernel<{{b}}, {{block_n}}, accum>(
-                    A + m * lda,
+                    A_block_{{b}},
                     B,
                     C + m * ldc,
                     K,
-                    lda,
+                    K,
                     ldb,
                     ldc
                 );
                 break;
+            }
     {%- endfor %}
             default:
                 {{kernel.assert_function}}(false, "Unsupported block_m: {{block_m}}");
@@ -969,7 +984,7 @@ class CppMicroGemmWoQSmallMDim(CppMicroGemm):
     TEMPLATE_KERNEL = r"""
 template <int64_t BLOCK_M, int64_t BLOCK_N, bool accum>
 inline void {{kernel_name}}_kernel(
-    const {{input_t}}* {{restrict_keyword}} A,
+    const float* {{restrict_keyword}} A,
     const {{input2_t}}* {{restrict_keyword}} B,
     {{output_t}}* {{restrict_keyword}} C,
     int64_t K,
@@ -977,65 +992,44 @@ inline void {{kernel_name}}_kernel(
     int64_t ldb,
     int64_t ldc
 ) {
-    using Vectorized = at::vec::Vectorized<{{compute_t}}>;
-    using VectorizedIn = at::vec::Vectorized<{{input_t}}>;
-    constexpr auto VLEN = Vectorized::size();
+    constexpr auto VLEN = 16;
     constexpr auto ROWS = BLOCK_M;
     constexpr auto COLS = BLOCK_N / VLEN;
-
-    Vectorized va;
-    at::vec::VectorizedN<{{compute_t}}, COLS> vb;
-    at::vec::VectorizedN<{{compute_t}}, ROWS*COLS> vc;
+    __m512 va;
+    __m512 vb[COLS];
+    __m512 vc[ROWS * COLS];
 
     auto loadc = [&](auto i) {
-        if constexpr (accum) {
-            constexpr int row = i / COLS;
-            constexpr int col = i % COLS;
-            vc[i] = Vectorized::loadu(C + row * ldc + col * VLEN);
-        } else {
-            vc[i] = Vectorized(0.0f);
-        }
+        vc[i] = _mm512_set1_ps(0.0f);
     };
     c10::ForcedUnroll<ROWS * COLS>{}(loadc);
-
     auto compute = [&, COLS](auto i, int k) {
         constexpr int row = i / COLS;
         constexpr int col = i % COLS;
-
         if constexpr (col == 0) {
-{%- if alpha != 1 %}
-            va = Vectorized(static_cast<{{compute_t}}>(A[row * lda + k]) * {{alpha}});
-{%- else %}
-            va = Vectorized(static_cast<{{compute_t}}>(A[row * lda + k]));
-{%- endif %}
+            va = _mm512_set1_ps(A[row * lda + k]);
         }
-
         if constexpr (row == 0) {
-{%- if input2_dtype in [torch.bfloat16, torch.float16] %}
-            auto b = VectorizedIn::loadu(B + k * ldb + col * VLEN, VLEN);
-            vb[col] = at::vec::convert<{{compute_t}}>(b);
-{%- elif input2_dtype == torch.int8 %}
-            // Convert VLEN int8 elements to int32, and then fp32
-            auto b32 = at::vec::convert_to_int32<int8_t>(B + k * ldb + col * VLEN);
-            vb[col] = at::vec::convert<float>(b32);
-{%- else %}
-            vb[col] = Vectorized::loadu(B + k * ldb + col * VLEN);
-{%- endif %}
+            // Convert VLEN int8 elements to int16, then fp16, and then apply scale
+            auto int8_vector = _mm_loadu_si128((__m128i*)(B + k * ldb + col * VLEN));
+            vb[col] =  _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(int8_vector));
+            _mm_prefetch(B + (k + {{block_k}}) * ldb + col * VLEN, _MM_HINT_T0);
         }
-
-        constexpr int idx = row * COLS + col;
-        vc[idx] = at::vec::fmadd(va, vb[col], vc[idx]);
+        vc[i] = _mm512_fmadd_ps(va, vb[col], vc[i]);
     };
-
-    for (int k = 0; k < K; ++k) {
-        c10::ForcedUnroll<ROWS * COLS>{}(compute, k);
+    // Accumulate along k
+    for (int k = 0; k < K; k++) {
+      c10::ForcedUnroll<ROWS * COLS>{}(compute, k);
     }
-
     // store to C
     auto storec = [&](auto i) {
         constexpr int row = i / COLS;
         constexpr int col = i % COLS;
-        vc[i].store(C + row * ldc + col * VLEN);
+        if constexpr (accum) {
+            auto vc_old = _mm512_loadu_ps(C + row * ldc + col * VLEN);
+            vc[i] = _mm512_fmadd_ps(_mm512_set1_ps(1.0f), vc[i], vc_old);
+        }
+        _mm512_storeu_ps(C + row * ldc + col * VLEN, vc[i]);
     };
     c10::ForcedUnroll<ROWS * COLS>{}(storec);
 }
