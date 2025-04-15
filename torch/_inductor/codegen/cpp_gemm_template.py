@@ -240,22 +240,50 @@ GEMM_TEMPLATE = r"""
         {%- set tile_qparam = None %}
     {%- endif %}
 {%- endif %}
+                        // Prefetch only if the next B tile is below the current one, so there would only be one
+                        // iteration of the loop that iterates over nci
+                        bool prefetch_B_tile = (nc + 1) == nc_block_end;
+                        // TODO: Figure out a way to use the above variable's value in a codegen call
                         if (kc == k_block_start) {
-                            {{ micro_gemm.codegen_call(kernel,
-                                                       tile_X,
-                                                       tile_W,
-                                                       acc_slice,
-                                                       accum=False,
-                                                       qscale_and_zeros=tile_qparam)|indent(28, false)
-                            }}
+                            if (prefetch_B_tile) {
+                                {{ micro_gemm.codegen_call(kernel,
+                                                        tile_X,
+                                                        tile_W,
+                                                        acc_slice,
+                                                        accum=False,
+                                                        prefetch=True,
+                                                        qscale_and_zeros=tile_qparam)|indent(28, false)
+                                }}
+                            } else {
+                                {{ micro_gemm.codegen_call(kernel,
+                                                        tile_X,
+                                                        tile_W,
+                                                        acc_slice,
+                                                        accum=False,
+                                                        prefetch=False,
+                                                        qscale_and_zeros=tile_qparam)|indent(28, false)
+                                }}
+                            }
                         } else {
-                            {{ micro_gemm.codegen_call(kernel,
-                                                       tile_X,
-                                                       tile_W,
-                                                       acc_slice,
-                                                       accum=True,
-                                                       qscale_and_zeros=tile_qparam)|indent(28, false)
-                            }}
+                            if (prefetch_B_tile) {
+                                {{ micro_gemm.codegen_call(kernel,
+                                                        tile_X,
+                                                        tile_W,
+                                                        acc_slice,
+                                                        accum=True,
+                                                        prefetch=True,
+                                                        qscale_and_zeros=tile_qparam)|indent(28, false)
+                                }}
+                            } else {
+                                {{ micro_gemm.codegen_call(kernel,
+                                                        tile_X,
+                                                        tile_W,
+                                                        acc_slice,
+                                                        accum=True,
+                                                        prefetch=False,
+                                                        qscale_and_zeros=tile_qparam)|indent(28, false)
+                                }}
+                            }
                         }
                     }
                 }

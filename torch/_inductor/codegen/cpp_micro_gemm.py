@@ -55,7 +55,7 @@ class CppMicroGemm:
 
     # TODO(jgong5): support constant shapes and lds as template args.
     DECLARE_KERNEL = r"""
-template <bool accum>
+template <bool accum, bool prefetch = false>
 inline void {{kernel_name}}(
 {%- if kernel_extra_args_declare %}
     {{kernel_extra_args_declare}}
@@ -138,6 +138,7 @@ inline void {{kernel_name}}(
         B: ir.Buffer,
         C: ir.Buffer,
         accum: bool,
+        prefetch: bool,
         **kwargs_for_extra_args,
     ) -> str:
         """
@@ -154,7 +155,9 @@ inline void {{kernel_name}}(
         ldb = kernel.stride(B, 0)
         ldc = kernel.stride(C, 0)
         res = IndentedBuffer()
-        res.writeline(f"{self.name}<{value_to_cpp(accum, 'bool')}>(")
+        res.writeline(
+            f"{self.name}<{value_to_cpp(accum, 'bool')}, {value_to_cpp(prefetch, 'bool')}>("
+        )
         with res.indent():
             kwargs_for_extra_args.update({"kernel": kernel})
             extra_args = self.get_kernel_extra_args(**kwargs_for_extra_args)
@@ -431,9 +434,9 @@ class CppMicroGemmFP32Vec(CppMicroGemm):
 {%- for b in range(block_m - 1, 0, -1) %}
                 case {{b}}:
     {%- if not trans_b %}
-                    {{kernel_name}}_kernel<{{b}}, {{block_n}}, accum>(
+                    {{kernel_name}}_kernel<{{b}}, {{block_n}}, accum, prefetch>(
     {%- else %}
-                    {{kernel_name}}_transpose_b_kernel<{{b}}, {{block_n}}, accum>(
+                    {{kernel_name}}_transpose_b_kernel<{{b}}, {{block_n}}, accum, prefetch>(
     {%- endif %}
                         A + m * lda,
     {%- if not trans_b %}
@@ -459,9 +462,9 @@ class CppMicroGemmFP32Vec(CppMicroGemm):
     {%- for b in range(block_m, 0, -1) %}
                 case {{b}}:
         {%- if not trans_b %}
-                    {{kernel_name}}_ntail_kernel<{{b}}, {{block_n}}, accum>(
+                    {{kernel_name}}_ntail_kernel<{{b}}, {{block_n}}, accum, prefetch>(
         {%- else %}
-                    {{kernel_name}}_ntail_transpose_b_kernel<{{b}}, {{block_n}}, accum>(
+                    {{kernel_name}}_ntail_transpose_b_kernel<{{b}}, {{block_n}}, accum, prefetch>(
         {%- endif %}
                         A + m * lda,
         {%- if not trans_b %}
@@ -492,7 +495,7 @@ class CppMicroGemmFP32Vec(CppMicroGemm):
 
     TEMPLATE_KERNEL = r"""
 
-template <int64_t BLOCK_M, int64_t BLOCK_N, bool accum>
+template <int64_t BLOCK_M, int64_t BLOCK_N, bool accum, bool prefetch = false>
 {%- if not trans_b %}
     {%- if tail_n %}
 inline void {{kernel_name}}_ntail_kernel(
@@ -597,7 +600,9 @@ inline void {{kernel_name}}_transpose_b_kernel(
             vb[col] = Vectorized::loadu(B + k * ldb + col * VLEN);
         {%- endif %}
     {%- endif %}
-
+            if C10_LIKELY(prefetch) {
+                _mm_prefetch(B + (k + {{block_k}}) * ldb + col * VLEN, _MM_HINT_T0);
+            }
         }
 
         constexpr int idx = row * COLS + col;
